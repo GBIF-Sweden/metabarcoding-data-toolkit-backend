@@ -7,6 +7,7 @@ import {writeEmlJson, writeEmlXml, getCurrentDatasetVersion, getMetadata, dwcArc
 import auth from './Auth/auth.js';
 import db from './db/index.js'
 import { md5 } from '../util/index.js';
+import { metadataReadiness } from '../validation/readiness.js';
 import config from '../config.js';
 
 const processEml = async function (req, res) {
@@ -17,17 +18,25 @@ const processEml = async function (req, res) {
             let version = req?.query?.version;
             if(!version){
                 version = await getCurrentDatasetVersion(req.params.id)
-            } 
-            await writeEmlJson(req.params.id, version, {...req.body, createdBy: req?.user?.userName, createdAt: Date.now()})
-            const xml = getEml({...req.body, id : req.params.id})
+            }
+            // Preserve server-side-only fields the client never sees or edits
+            const existing = await getMetadata(req.params.id, version);
+            const serverSideFields = existing?.faire_description
+                ? { faire_description: existing.faire_description }
+                : {};
+            const toWrite = { ...req.body, ...serverSideFields, createdBy: req?.user?.userName, createdAt: Date.now() };
+            await writeEmlJson(req.params.id, version, toWrite)
+            const xml = getEml({...req.body, ...serverSideFields, id : req.params.id})
             await writeEmlXml(req.params.id, version, xml)
             await db.updateTitleOnDataset(req?.user?.userName, req.params.id, req.body?.title)
 
             if(!!req.body?.description){
                 await db.updateDescriptionOnDataset(req?.user?.userName, req.params.id, req.body?.description.substring(0, 300))
             }
-           // console.log(eml)
-            res.send(req.body) 
+            // hand the readiness back so the client can open the export and publish steps as
+            // soon as the metadata is complete, rather than waiting for the next poll
+            const {ready, missing} = metadataReadiness(toWrite);
+            res.json({...req.body, metadataReady: ready, metadataMissing: missing})
         } catch (error) {
             console.log(error)
             res.sendStatus(500)

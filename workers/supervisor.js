@@ -20,12 +20,15 @@ const workers = {
     TSV_WITH_FASTA: 'tsvworker.js',
     XLSX: 'xlsxworker.js',
     XLSX_WITH_FASTA: 'xlsxworker.js',
-    BIOM_2_1: 'biomworker.js'
+    BIOM_2_1: 'biomworker.js',
+    FAIRe: 'faireworker.js'
 }
 
 const prepareForProcessing = async (id, version, job) => {
     job.steps.push({ ...STEPS.validating, status: 'processing', time: Date.now() })
         runningJobs.set(id, job);
+
+        const previousSelectedAssay = job.files?.selectedAssay ?? null;
 
         let files = await uploadedFilesAndTypes(id, version)
         const fileMap = _.keyBy(files.files, "type")
@@ -45,6 +48,10 @@ const prepareForProcessing = async (id, version, job) => {
         } else {
             job.files = files
             job.unzip = false;
+        }
+
+        if (previousSelectedAssay) {
+            job.files.selectedAssay = previousSelectedAssay;
         }
 
         if (files.format.startsWith('TSV')) {
@@ -154,8 +161,11 @@ export const processDataset = (id, version, job) => {
             } 
             if(message?.type === 'finishedJobSuccesssFully'){
                  if(job?.summary?.taxonCount && job?.summary?.sampleCount){
+                    // bookkeeping only - the dataset is processed either way, and an
+                    // unhandled rejection here would take the whole service down
                     db.updateCountsOnDataset(job.createdBy, id, job?.summary?.sampleCount, job?.summary?.taxonCount)
-                } 
+                        .catch(error => console.log(`Could not update counts on dataset ${id}: ${error?.message || error}`))
+                }
                 resolve()
             }
             if(message?.type === 'finishedJobWithError'){
@@ -205,16 +215,17 @@ export const createDwc = (id, version, job) => {
             }
 
             if(message?.type === 'finishedJobSuccesssFully'){
+                    // bookkeeping only - the archive is generated either way. A try/catch
+                    // around a call that is not awaited catches nothing, and the unhandled
+                    // rejection that got through took the whole service down
                     if(job?.summary?.occurrenceCount){
-                        
+
                        db.updateOccurrenceCountOnDataset(job.createdBy, id, job?.summary?.occurrenceCount)
-                   }  
-                   try {
-                    db.updateDwcGeneratedOnDataset(job.createdBy, id, new Date().toISOString())    
-                   } catch (error) {
-                    console.log(error)
-                   } 
-                     
+                            .catch(error => console.log(`Could not update occurrence count on dataset ${id}: ${error?.message || error}`))
+                   }
+                   db.updateDwcGeneratedOnDataset(job.createdBy, id, new Date().toISOString())
+                        .catch(error => console.log(`Could not update dwc generated timestamp on dataset ${id}: ${error?.message || error}`))
+
                 resolve()
             }
             if(message?.type === 'finishedJobWithError'){
@@ -300,8 +311,32 @@ export const validateXlSX = (id, version, userName) => {
         work.on('message', (message) => {
             
             if(message?.type === 'finishedJobSuccesssFully'){
-                           
-                resolve()
+                // the validators send back the report they wrote, so the caller does not
+                // have to read it from disk again
+                resolve(message?.payload)
+            }
+            if(message?.type === 'finishedJobWithError'){
+                reject(message?.payload)
+            }
+
+        })
+
+
+    })
+}
+
+export const validateFAIRe = (id, version, userName) => {
+
+    return new Promise(async (resolve, reject) => {
+        const work = fork(__dirname + '/fairevalidationworker.js', [...process.argv, '--id', id, '--version', version, '--username', userName]);
+
+
+        work.on('message', (message) => {
+            
+            if(message?.type === 'finishedJobSuccesssFully'){
+                // the validators send back the report they wrote, so the caller does not
+                // have to read it from disk again
+                resolve(message?.payload)
             }
             if(message?.type === 'finishedJobWithError'){
                 reject(message?.payload)

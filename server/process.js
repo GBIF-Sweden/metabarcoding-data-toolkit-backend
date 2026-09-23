@@ -3,7 +3,7 @@ import * as url from 'url';
 import auth from './Auth/auth.js';
 import _ from 'lodash'
 import { getCurrentDatasetVersion, writeProcessingReport, wipeGeneratedFilesAndResetProccessing, readTsvHeaders, readMapping } from '../util/filesAndDirectories.js'
-import { getDataset } from '../util/dataset.js';
+import { getDataset, withMetadataState } from '../util/dataset.js';
 
 import {processDataset} from '../workers/supervisor.js'
 import queue from 'async/queue.js';
@@ -11,6 +11,8 @@ import STEPS from '../enum/processingSteps.js'
 import runningJobs from '../workers/runningJobs.js';
 import { dwcQueue } from './dwc.js';
 import { dwcDpQueue } from './dwcdp.js';
+import { mappingReadiness } from '../validation/readiness.js';
+import { isValidationRunning } from './validation.js';
 
 const q = queue(async (options) => {
     const id = options?.id;
@@ -111,6 +113,22 @@ const addPendingSteps = job => {
     return [...steps_, ...Object.keys(STEPS).filter(s => (!job.unzip ? s !== 'extractArchive' : true) && (!job.assignTaxonomy ? s !== 'assignTaxonomy' : true) && !steps_.map(a => a?.name).includes(s)).map(k => STEPS[k])]
 }
 
+// Tells the client whether the term mapping step can be shown yet, and if not, whether a
+// validation is still running or nothing is coming. Derived here rather than in getDataset,
+// because pushJob spreads getDataset's result into the job and the job is written back as the
+// report - a derived field added there would be persisted and go stale.
+const withMappingState = (report, id) => {
+
+    const { ready, missing } = mappingReadiness(report);
+
+    return withMetadataState({
+        ...report,
+        mappingReady: ready,
+        mappingMissing: missing,
+        validationRunning: isValidationRunning(id)
+    })
+}
+
 const getProcess = async (req, res) => {
 
     if (!req.params.id) {
@@ -135,13 +153,13 @@ const getProcess = async (req, res) => {
             if (job) {
                 let data = { ...report, ...job, steps: addPendingSteps(job) };
               //  console.log("Process request 5")
-                return data
+                return withMappingState(data, req.params.id)
                 // res.json(data);
             } else {
               //  console.log("Process request 6")
 
                 if (report) {
-                    return report;
+                    return withMappingState(report, req.params.id);
                     //res.json(report)
                 } else {
                     return null
@@ -167,7 +185,13 @@ export default (app) => {
                 if (!runningJobs.has(req.params.id)) {
                     let assignTaxonomy = req?.query?.assignTaxonomy && (req?.query?.assignTaxonomy === true || req?.query?.assignTaxonomy === "true" )
                     let skipSimiliarityPlots = req?.query?.skipSimiliarityPlots && (req?.query?.skipSimiliarityPlots === true || req?.query?.skipSimiliarityPlots === "true" )
-                    pushJob({id:req.params.id, assignTaxonomy, user:req?.user, skipSimiliarityPlots} );
+                    // Awaited, so the job is in runningJobs before the client is told to start
+                    // polling. Unawaited, the 201 went out while pushJob was still clearing the
+                    // previous run's files - and a poll arriving in that window found no running
+                    // job and was answered from the report on disk, which still held the old
+                    // steps. The client had just cleared them, so they reappeared.
+                    // pushJob resolves once the job is queued, not once processing is done.
+                    await pushJob({id:req.params.id, assignTaxonomy, user:req?.user, skipSimiliarityPlots} );
                     res.sendStatus(201)
                 } else {
                     res.sendStatus(302)
@@ -189,11 +213,14 @@ export default (app) => {
             try {
                  const report = await getProcess(req, res)
                     if (report) {
+                        // the client polls this while validation is still writing the report,
+                        // a proxy holding on to an early copy would hide the transition
+                        res.set('Cache-Control', 'no-store')
                         res.json(report)
                     } else {
                         res.sendStatus(404)
                     }
-                
+
             } catch (error) {
                 console.log(error)
                 res.sendStatus(404)

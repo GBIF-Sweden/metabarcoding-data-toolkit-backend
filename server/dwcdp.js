@@ -1,4 +1,6 @@
 import { getProcessingReport, writeProcessingReport, getMetadata, getCurrentDatasetVersion,  wipeGeneratedDwcDpFiles} from '../util/filesAndDirectories.js'
+import { withMetadataState } from '../util/dataset.js';
+import { metadataReadiness, metadataMissingMessage } from '../validation/readiness.js';
 
 import {getFileSize} from '../validation/files.js'
 import config from '../config.js'
@@ -40,7 +42,18 @@ const pushJob = async (id, version, user) => {
             if (error) {
                 console.log(error);
                 let job = runningJobs.get(dwcdpID);
-                job.steps.push({ status: 'failed', message: error?.message, time: Date.now() })
+                job.steps.push({ status: 'failed', message: error?.message || error, time: Date.now() })
+                // see the same note in dwc.js - without this the failure never reaches any
+                // response and a client polling for a terminal state waits forever
+                try {
+                    const report = await getProcessingReport(id, version);
+                    if (report) {
+                        report.dwcdp = job;
+                        await writeProcessingReport(id, version, report)
+                    }
+                } catch (reportError) {
+                    console.log(reportError)
+                }
                 runningJobs.delete(dwcdpID)
                 //runningJobs.set(id, {...runningJobs.get(id), status: 'failed'} )
                // throw error
@@ -93,6 +106,13 @@ const processDwcDP = async function (req, res) {
                 version = await getCurrentDatasetVersion(req.params.id)
             } 
             console.log("Version "+version)
+                // the data package embeds eml.xml the same way the archive does, and the copy
+                // in converters/dwcdp.js only logs when it is not there - so an incomplete
+                // metadata would silently produce a package with no EML at all
+                const {ready, missing} = metadataReadiness(await getMetadata(req.params.id, version))
+                if(!ready){
+                    return res.status(400).json({message: metadataMissingMessage(missing), metadataMissing: missing})
+                }
                 // Make sure a job is not already running
                 if(!runningJobs.has(`${req.params.id}:dwcdp`)){
                     console.log("Push job")
@@ -142,9 +162,9 @@ const getDwcDpProcess = async (req, res) => {
             if (job) {
                
                 let dwcdp = {...job, steps: addPendingSteps(job)};
-                return {...report, dwcdp: dwcdp};
+                return withMetadataState({...report, dwcdp: dwcdp});
             } else {        
-                return report
+                return withMetadataState(report)
            
         }
         } catch (error) {
